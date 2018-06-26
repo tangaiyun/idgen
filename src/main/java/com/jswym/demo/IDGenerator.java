@@ -6,6 +6,8 @@ import java.util.Set;
 
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.framework.state.ConnectionState;
+import org.apache.curator.framework.state.ConnectionStateListener;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.zookeeper.CreateMode;
 import org.slf4j.Logger;
@@ -39,14 +41,30 @@ public class IDGenerator {
 	
 	private CuratorFramework client;
 
-	private long workerId;
-	private long sequence = 0L;
-	private boolean isInitialized = false;
+	private volatile long workerId;
+	private volatile long sequence = 0L;
+	private volatile boolean isInitialized = false;
+	private volatile boolean isNormal = true;
 	
 	private void init() {
-		client = CuratorFrameworkFactory.newClient(zkConStr, new ExponentialBackoffRetry(1000, 3));
+		client = CuratorFrameworkFactory.newClient(zkConStr, 1000*60, 1000*15, new ExponentialBackoffRetry(1000, 3));
 		client.start();
-		this.workerId = getUniqueWorkerId();
+		long n = getUniqueWorkerId();
+		this.workerId = n;
+		client.getConnectionStateListenable().addListener(new ConnectionStateListener() {
+		    public void stateChanged(CuratorFramework client, ConnectionState newState) {
+		    	if(newState == ConnectionState.LOST) {
+		    		LOGGER.error(String.format(" the id generator with workid %d lost connection to zookeeper cluster.", workerId));
+		    		IDGenerator.this.isNormal = false;
+		        }
+		        if(newState == ConnectionState.RECONNECTED) {
+		        	LOGGER.info(String.format(" the id generator with workid %d reconnected to zookeeper cluster.", workerId));
+		        	long n = getUniqueWorkerId();
+		    		IDGenerator.this.workerId = n;
+		    		IDGenerator.this.isNormal = true;
+		        }
+		    }
+		});
 		isInitialized = true;
 		LOGGER.info(String.format(
 				"worker starting. timestamp left shift %d, worker id bits %d, sequence bits %d, workerid %d",
@@ -54,6 +72,10 @@ public class IDGenerator {
 	}
 
 	public synchronized long nextId() {
+		if(!isNormal) {
+			LOGGER.error(String.format(" the id generator with workid %d lost connection to zookeeper cluster, so it can not generate new id.", workerId));
+			throw new RuntimeException("the id generator is out of service now, because it can not connect to zookeeper cluster!");
+		}
 		if(!isInitialized) {
 			init();
 		}
@@ -102,7 +124,7 @@ public class IDGenerator {
 			client.create().creatingParentsIfNeeded().withMode(CreateMode.EPHEMERAL_SEQUENTIAL).forPath(parentNodePath+workerPathPrefix,
 					(retVal + "").getBytes());
 		} catch (Exception e) {
-
+			LOGGER.error("Zookeeper operation failed.");
 		}
 		return retVal;
 	}
